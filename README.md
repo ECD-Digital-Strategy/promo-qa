@@ -30,7 +30,15 @@ cards like "Promo QA" or "LABOR15 QA" are ignored.
   `npm run webhook:sync-tasks` does the same on demand (`-- --dry-run` to
   preview).
 - A `pg_cron` safety net (`promo-qa-safety-net`) runs a full sweep every
-  4 hours.
+  4 hours. Full sweeps reconcile task webhooks against Asana's own list, and
+  the cron run also prunes run history older than 90 days.
+- `asana-webhook` only accepts a new hook-secret handshake while qa-runner or a
+  setup script has opened a short registration window, answers Asana
+  immediately, and runs each comment once even when both a project and a task
+  webhook deliver it.
+- Claude answers for store, design-readiness and comment-intent questions are
+  cached for 14 days by their exact input (`ai_answer_cache`), so unchanged
+  tasks aren't re-asked on every sweep.
 
 ## Safety
 

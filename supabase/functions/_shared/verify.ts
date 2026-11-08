@@ -147,7 +147,7 @@ export function formatFailureComment(verdict: QaVerdict): string {
  * posting again would only repeat it. New or changed issues return false.
  */
 export function failureIssuesCoveredBy(
-  verdict: Pick<QaVerdict, "banners">,
+  verdict: Pick<QaVerdict, "banners"> & Partial<Pick<QaVerdict, "warnings">>,
   previousCommentText: string,
 ): boolean {
   const normalize = (value: string) =>
@@ -158,7 +158,15 @@ export function failureIssuesCoveredBy(
     .flatMap((banner) => banner.issues ?? [])
     .map(normalize)
     .filter(Boolean);
-  return issues.every((issue) => previous.includes(issue));
+  // No itemised issues (missing banners, low confidence): the comment is just
+  // its warnings, so compare those. With nothing at all to compare, don't
+  // claim the earlier comment already said it.
+  const compared = issues.length ? issues : (verdict.warnings ?? [])
+    .filter(isActionableWarning)
+    .map(normalize)
+    .filter(Boolean);
+  if (!compared.length) return false;
+  return compared.every((item) => previous.includes(item));
 }
 
 function guardBanner(

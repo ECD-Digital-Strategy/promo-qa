@@ -17,8 +17,28 @@ const asanaHeaders = {
   "Content-Type": "application/json",
 };
 
+// Must match isPromoQaTask in supabase/functions/_shared/asana.ts.
 function isBannerQaTask(name) {
-  return /\bbanner\b/i.test(name) && /\bqa\b/i.test(name);
+  return /\bbanners?\b/i.test(name) && /\bqa\b/i.test(name);
+}
+
+// asana-webhook only accepts a hook-secret handshake while this is open.
+async function openHandshakeWindow(minutes) {
+  const response = await fetch(`${supabaseUrl}/rest/v1/promo_qa_settings?on_conflict=key`, {
+    method: "POST",
+    headers: {
+      apikey: serviceRoleKey,
+      Authorization: `Bearer ${serviceRoleKey}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates",
+    },
+    body: JSON.stringify({
+      key: "asana_webhook_handshake",
+      value: { open_until: new Date(Date.now() + minutes * 60_000).toISOString() },
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  if (!response.ok) throw new Error(await response.text());
 }
 
 async function asanaRequest(path, init = {}) {
@@ -123,16 +143,28 @@ const webhooks = [];
 let created = 0;
 let skipped = 0;
 let removed = 0;
+let handshakeOpen = false;
 for (const resourceGid of resourceGids) {
   const current = existing.get(resourceGid);
-  if (current) {
+  if (current?.active) {
     skipped += 1;
-    webhooks.push({ gid: current.gid, task_gid: resourceGid, active: current.active });
+    webhooks.push({ gid: current.gid, task_gid: resourceGid, active: true });
     continue;
   }
   if (dryRun) {
-    console.log(`Would register ${resourceGid}`);
+    console.log(current
+      ? `Would replace inactive webhook on ${resourceGid}`
+      : `Would register ${resourceGid}`);
     continue;
+  }
+  if (current) {
+    // Asana stopped delivering to it; replace it with a fresh one.
+    await asanaRequest(`/webhooks/${current.gid}`, { method: "DELETE" });
+    existing.delete(resourceGid);
+  }
+  if (!handshakeOpen) {
+    await openHandshakeWindow(10);
+    handshakeOpen = true;
   }
   const result = await createWebhook(resourceGid);
   if (result.status === "created") {

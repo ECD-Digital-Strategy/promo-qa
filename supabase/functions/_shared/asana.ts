@@ -10,6 +10,8 @@ import type {
 } from "./types.ts";
 
 const ASANA_API = "https://app.asana.com/api/1.0";
+// Emil, the account Promo QA works as (overridable with ASANA_ASSIGNEE_GID).
+const DEFAULT_ASSIGNEE_GID = "1206406200377321";
 const TASK_FIELDS = [
   "name",
   "notes",
@@ -136,21 +138,35 @@ export class AsanaClient {
     return isPerson(fallback) ? fallback : null;
   }
 
+  /**
+   * Every story on a task, oldest first. Asana pages at 100 and returns the
+   * oldest first, so reading one page hides the newest comments on busy tasks.
+   */
+  private async listStories<T>(
+    taskGid: string,
+    optFields: string,
+  ): Promise<T[]> {
+    const stories: T[] = [];
+    let offset: string | undefined;
+    do {
+      const query = new URLSearchParams({ opt_fields: optFields, limit: "100" });
+      if (offset) query.set("offset", offset);
+      const page = await this.request<T[]>(`/tasks/${taskGid}/stories?${query}`);
+      stories.push(...page.data);
+      offset = page.next_page?.offset;
+    } while (offset);
+    return stories;
+  }
+
   async getCreator(
     task: AsanaTask,
   ): Promise<{ gid: string; name: string } | null> {
     if (task.created_by?.gid) return task.created_by;
 
-    const query = new URLSearchParams({
-      opt_fields: "created_at,created_by.gid,created_by.name,type",
-      limit: "100",
-    });
-    const stories = (await this.request<
-      Array<{
-        created_at: string;
-        created_by?: { gid: string; name: string };
-      }>
-    >(`/tasks/${task.gid}/stories?${query}`)).data;
+    const stories = await this.listStories<{
+      created_at: string;
+      created_by?: { gid: string; name: string };
+    }>(task.gid, "created_at,created_by.gid,created_by.name,type");
 
     return stories
       .filter((story) => story.created_by?.gid)
@@ -204,18 +220,12 @@ export class AsanaClient {
     const normalizedNeedle = needle.trim().toLowerCase();
     if (!normalizedNeedle) return null;
 
-    const query = new URLSearchParams({
-      opt_fields: "type,text,html_text,created_at",
-      limit: "100",
-    });
-    const stories = (await this.request<
-      Array<{
-        type?: string;
-        text?: string;
-        html_text?: string;
-        created_at?: string;
-      }>
-    >(`/tasks/${taskGid}/stories?${query}`)).data;
+    const stories = await this.listStories<{
+      type?: string;
+      text?: string;
+      html_text?: string;
+      created_at?: string;
+    }>(taskGid, "type,text,html_text,created_at");
 
     let latest: { created_at: string; text: string } | null = null;
     for (const story of stories) {
@@ -261,20 +271,17 @@ export class AsanaClient {
   }
 
   async listTaskComments(taskGid: string): Promise<IncomingComment[]> {
-    const query = new URLSearchParams({
-      opt_fields: "gid,type,text,html_text,created_at,created_by.gid,created_by.name",
-      limit: "100",
-    });
-    const stories = (await this.request<
-      Array<{
-        gid: string;
-        type?: string;
-        text?: string;
-        html_text?: string;
-        created_at?: string;
-        created_by?: { gid?: string; name?: string };
-      }>
-    >(`/tasks/${taskGid}/stories?${query}`)).data;
+    const stories = await this.listStories<{
+      gid: string;
+      type?: string;
+      text?: string;
+      html_text?: string;
+      created_at?: string;
+      created_by?: { gid?: string; name?: string };
+    }>(
+      taskGid,
+      "gid,type,text,html_text,created_at,created_by.gid,created_by.name",
+    );
 
     return stories
       .filter((story) => story.type === "comment" && story.created_at)
@@ -325,26 +332,22 @@ export class AsanaClient {
       }),
     );
 
-    const storyQuery = new URLSearchParams({
-      opt_fields: "type,text,html_text,created_at,created_by.name",
-      limit: "100",
-    });
-    const comments = (await this.request<
-      Array<{
-        type?: string;
-        text?: string;
-        html_text?: string;
-        created_at?: string;
-        created_by?: { name?: string };
-      }>
-    >(`/tasks/${parent.gid}/stories?${storyQuery}`)).data
+    const comments = (await this.listStories<{
+      type?: string;
+      text?: string;
+      html_text?: string;
+      created_at?: string;
+      created_by?: { name?: string };
+    }>(parent.gid, "type,text,html_text,created_at,created_by.name"))
       .filter((story) => story.type === "comment")
       .map((story): PromoDesignComment => ({
         author: story.created_by?.name,
         text: stripHtml(story.text ?? story.html_text ?? ""),
         created_at: story.created_at,
       }))
-      .filter((comment) => comment.text.trim().length > 0);
+      .filter((comment) => comment.text.trim().length > 0)
+      // The latest discussion is what says whether design is done.
+      .slice(-50);
 
     return { parentTask: parent, subtasks, comments };
   }
@@ -438,6 +441,41 @@ export class AsanaClient {
     return webhooks.find((webhook) => webhook.target === targetUrl) ?? null;
   }
 
+  /** Task-level webhooks in the workspace that deliver to targetUrl. */
+  async listTaskWebhooks(
+    workspaceGid: string,
+    targetUrl: string,
+  ): Promise<Array<{ gid: string; active: boolean; taskGid: string }>> {
+    const webhooks: Array<{ gid: string; active: boolean; taskGid: string }> = [];
+    let offset: string | undefined;
+    do {
+      const query = new URLSearchParams({
+        workspace: workspaceGid,
+        limit: "100",
+        opt_fields: "gid,active,target,resource.gid,resource.resource_type",
+      });
+      if (offset) query.set("offset", offset);
+      const page = await this.request<Array<{
+        gid: string;
+        active: boolean;
+        target?: string;
+        resource?: { gid?: string; resource_type?: string };
+      }>>(`/webhooks?${query}`);
+      for (const webhook of page.data) {
+        // Project webhooks share the target; only task webhooks are ours to manage.
+        if (webhook.target !== targetUrl) continue;
+        if (webhook.resource?.resource_type !== "task" || !webhook.resource.gid) continue;
+        webhooks.push({
+          gid: webhook.gid,
+          active: webhook.active,
+          taskGid: webhook.resource.gid,
+        });
+      }
+      offset = page.next_page?.offset;
+    } while (offset);
+    return webhooks;
+  }
+
   async deleteWebhook(webhookGid: string): Promise<void> {
     await this.request(`/webhooks/${webhookGid}`, { method: "DELETE" });
   }
@@ -459,7 +497,7 @@ export class AsanaClient {
       creator: await this.getCommentRecipient(
         task,
         parent,
-        Deno.env.get("ASANA_ASSIGNEE_GID") ?? undefined,
+        Deno.env.get("ASANA_ASSIGNEE_GID") || DEFAULT_ASSIGNEE_GID,
       ),
       editorTarget,
     };
@@ -508,7 +546,7 @@ export function getMissingLinkRecipient(
     const recipient = usable(subtask.assignee_gid, subtask.assignee_name);
     if (recipient) return recipient;
   }
-  return fallback;
+  return usable(fallback?.gid, fallback?.name);
 }
 
 export function isPromoQaTask(task: Pick<AsanaTask, "name">): boolean {
@@ -694,12 +732,6 @@ export async function findMatchingWebhookSecret(
     }
   }
   return -1;
-}
-
-/** Moves a matched secret to the front so busy webhooks verify on the first try. */
-export function promoteSecret(secrets: string[], index: number): string[] {
-  if (index <= 0 || index >= secrets.length) return secrets;
-  return [secrets[index], ...secrets.slice(0, index), ...secrets.slice(index + 1)];
 }
 
 function timingSafeEqualHex(left: string, right: string): boolean {

@@ -14,9 +14,12 @@ export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5-5";
 // beyond the short JSON answers.
 const MAX_TOKENS = 16000;
 
-// Older models reject output_config.effort; ANTHROPIC_MODEL may point back at
-// one to roll back without a redeploy.
-const PRE_EFFORT_MODEL = /^claude-(?:3|sonnet-4-[05]|opus-4-[01]|haiku-4-5)/;
+// Only these models take output_config.effort; ANTHROPIC_MODEL may point back
+// at an older one to roll back without a redeploy.
+const EFFORT_MODEL =
+  /^claude-(?:opus-4-[5-9]|opus-[5-9]|sonnet-4-6|sonnet-[5-9]|haiku-[5-9]|fable-|mythos-)/;
+// Claude 3.x models cap output well below MAX_TOKENS.
+const LEGACY_MAX_TOKENS = 8192;
 // Models that accept server-side refusal fallback (`fallbacks: "default"`).
 const DEFAULT_FALLBACK_MODELS = new Set([
   "claude-sonnet-5-5",
@@ -33,14 +36,14 @@ export function buildMessageRequest(
   const headers: Record<string, string> = {};
   const body: Record<string, unknown> = {
     model,
-    max_tokens: MAX_TOKENS,
+    max_tokens: /^claude-3/.test(model) ? LEGACY_MAX_TOKENS : MAX_TOKENS,
     system,
     messages: [{
       role: "user",
       content: JSON.stringify(input),
     }],
   };
-  if (!PRE_EFFORT_MODEL.test(model)) {
+  if (EFFORT_MODEL.test(model)) {
     // Extraction and classification: low effort keeps thinking short.
     body.output_config = { effort: "low" };
   }
@@ -51,16 +54,72 @@ export function buildMessageRequest(
   return { headers, body };
 }
 
+/** Stores Claude answers so an unchanged question isn't asked twice. */
+export interface AiAnswerCache {
+  get(key: string): Promise<unknown | null>;
+  set(key: string, value: unknown): Promise<void>;
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text),
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 export class AnthropicClient {
   private readonly apiKey: string;
   private readonly model: string;
+  private readonly cache: AiAnswerCache | null;
 
   constructor(
     apiKey: string,
     model = DEFAULT_ANTHROPIC_MODEL,
+    cache: AiAnswerCache | null = null,
   ) {
     this.apiKey = apiKey;
     this.model = model;
+    this.cache = cache;
+  }
+
+  /**
+   * Same model + prompt + input returns the stored answer. Only for questions
+   * whose answer depends on nothing but the input (store, design readiness,
+   * comment intent), which cron and webhooks otherwise re-ask on every pass.
+   */
+  private async cachedJsonMessage<T>(
+    kind: string,
+    system: string,
+    input: unknown,
+    validate: (value: T) => void,
+  ): Promise<T> {
+    const key = this.cache
+      ? `${kind}:${await sha256Hex(
+        JSON.stringify([this.model, system, input]),
+      )}`
+      : null;
+    if (this.cache && key) {
+      const hit = await this.cache.get(key).catch(() => null);
+      if (hit !== null && hit !== undefined) {
+        try {
+          validate(hit as T);
+          return hit as T;
+        } catch {
+          // A stored answer that no longer validates is asked again.
+        }
+      }
+    }
+    const value = await this.jsonMessage<T>(system, input);
+    validate(value);
+    if (this.cache && key) {
+      await this.cache.set(key, value).catch((error) =>
+        console.error("Failed to store Claude answer:", error)
+      );
+    }
+    return value;
   }
 
   private async jsonMessage<T>(
@@ -196,7 +255,8 @@ Rules:
     }>;
     comments: Array<{ author?: string; text: string }>;
   }): Promise<DesignReadinessAssessment> {
-    const assessment = await this.jsonMessage<DesignReadinessAssessment>(
+    return await this.cachedJsonMessage<DesignReadinessAssessment>(
+      "design",
       `You decide whether a Shopify promo banner has finished design work and is realistically ready to be scheduled next.
 Return JSON only:
 {"designed":false,"confidence":0.0,"summary":"string","signals":["string"]}
@@ -208,10 +268,8 @@ Rules:
 - If evidence is weak or mixed, set designed=false and explain in summary/signals.
 - confidence is 0..1. Keep confidence below 0.7 when uncertain.`,
       input,
+      validateDesignReadiness,
     );
-
-    validateDesignReadiness(assessment);
-    return assessment;
   }
 
   async inferStoreSlug(input: {
@@ -226,11 +284,12 @@ Rules:
       shop_domain: string;
     }>;
   }): Promise<{ store_slug: string | null; confidence: number; reason: string }> {
-    const result = await this.jsonMessage<{
+    return await this.cachedJsonMessage<{
       store_slug: string | null;
       confidence: number;
       reason: string;
     }>(
+      "store",
       `You identify which registered Shopify store a promo QA Asana task belongs to.
 Return JSON only:
 {"store_slug":"string|null","confidence":0.0,"reason":"string"}
@@ -241,12 +300,12 @@ Rules:
 - Return null with low confidence when the store is ambiguous or not in the list.
 - confidence is 0..1.`,
       input,
+      (result) => {
+        if (typeof result?.confidence !== "number") {
+          throw new Error("Claude store inference omitted confidence");
+        }
+      },
     );
-
-    if (typeof result.confidence !== "number") {
-      throw new Error("Claude store inference omitted confidence");
-    }
-    return result;
   }
 
   async interpretTaskComment(input: {
@@ -263,7 +322,8 @@ Rules:
     lastQaStatus?: string | null;
     lastQaSummary?: string | null;
   }): Promise<CommentIntent> {
-    const intent = await this.jsonMessage<CommentIntent>(
+    const intent = await this.cachedJsonMessage<CommentIntent>(
+      "intent",
       `You are Emil's Promo QA automation on Asana. Someone just commented on a promo QA task (or tagged Emil on the parent promo card).
 Decide how to react. Return JSON only:
 {"action":"run_qa"|"reply"|"ignore","runQa":false,"forceQa":false,"replyNeeded":false,"reply":"string|null","reason":"string"}
@@ -279,15 +339,16 @@ Rules:
 - Use lastQaStatus/lastQaSummary only as prior context, not as a new check.
 - reply can be null when replyNeeded is false.`,
       input,
+      (value) => {
+        if (
+          value?.action !== "run_qa" &&
+          value?.action !== "reply" &&
+          value?.action !== "ignore"
+        ) {
+          throw new Error("Claude comment intent returned an invalid action");
+        }
+      },
     );
-
-    if (
-      intent.action !== "run_qa" &&
-      intent.action !== "reply" &&
-      intent.action !== "ignore"
-    ) {
-      throw new Error("Claude comment intent returned an invalid action");
-    }
     return {
       action: intent.action,
       runQa: Boolean(intent.runQa) || intent.action === "run_qa",

@@ -87,34 +87,26 @@ function extractHookSecret(response, payload) {
   return response.headers.get("X-Hook-Secret") ?? payload?.["X-Hook-Secret"] ?? null;
 }
 
-async function getStoredSecrets() {
-  const response = await fetch(
-    `${supabaseUrl}/rest/v1/promo_qa_settings?key=eq.asana_webhook_secret&select=value`,
-    {
-      headers: {
-        apikey: serviceRoleKey,
-        Authorization: `Bearer ${serviceRoleKey}`,
-      },
+// Atomic append (never rewrite the whole list: handshakes store secrets too).
+async function addSecret(secret) {
+  const response = await fetch(`${supabaseUrl}/rest/v1/rpc/add_asana_webhook_secret`, {
+    method: "POST",
+    headers: {
+      apikey: serviceRoleKey,
+      Authorization: `Bearer ${serviceRoleKey}`,
+      "Content-Type": "application/json",
     },
-  );
+    body: JSON.stringify({ p_secret: secret }),
+  });
   if (!response.ok) {
     throw new Error(await response.text());
   }
+}
 
-  const rows = await response.json();
-  const value = rows[0]?.value;
-  const secrets = [];
-  if (typeof value?.secret === "string" && value.secret) {
-    secrets.push(value.secret);
-  }
-  if (Array.isArray(value?.secrets)) {
-    for (const entry of value.secrets) {
-      if (typeof entry === "string" && entry && !secrets.includes(entry)) {
-        secrets.push(entry);
-      }
-    }
-  }
-  return secrets;
+async function openHandshakeWindow(minutes) {
+  await upsertSetting("asana_webhook_handshake", {
+    open_until: new Date(Date.now() + minutes * 60_000).toISOString(),
+  });
 }
 
 async function registerProjectWebhook(project) {
@@ -158,7 +150,10 @@ const results = {
   skipped: [],
   errors: [],
 };
-const secrets = await getStoredSecrets();
+
+// asana-webhook only accepts handshakes while this window is open, and stores
+// each hook secret itself during the handshake.
+await openHandshakeWindow(30);
 
 for (const project of projects) {
   const result = await registerProjectWebhook(project);
@@ -169,9 +164,7 @@ for (const project of projects) {
       project_name: project.name,
       active: result.webhook.active,
     });
-    if (result.secret && !secrets.includes(result.secret)) {
-      secrets.push(result.secret);
-    }
+    if (result.secret) await addSecret(result.secret);
     console.log(`Registered ${project.name}`);
   } else if (result.status === "skipped") {
     results.skipped.push({
@@ -186,13 +179,6 @@ for (const project of projects) {
     });
     console.error(`Failed ${project.name}: ${result.error}`);
   }
-}
-
-if (secrets.length) {
-  await upsertSetting("asana_webhook_secret", {
-    secret: secrets[0],
-    secrets,
-  });
 }
 
 await upsertSetting("asana_webhook_meta", {

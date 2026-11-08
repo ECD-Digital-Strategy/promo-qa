@@ -1,5 +1,9 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
-import { AnthropicClient, DEFAULT_ANTHROPIC_MODEL } from "../_shared/ai.ts";
+import {
+  type AiAnswerCache,
+  AnthropicClient,
+  DEFAULT_ANTHROPIC_MODEL,
+} from "../_shared/ai.ts";
 import {
   AsanaApiError,
   AsanaClient,
@@ -60,9 +64,31 @@ const supabase = createClient(
   { auth: { persistSession: false, autoRefreshToken: false } },
 );
 const asana = new AsanaClient(requiredEnv("ASANA_ACCESS_TOKEN"));
+// Cron and webhooks re-ask the same store / design / comment questions about
+// unchanged tasks; answers are kept for 14 days (pruned in housekeeping).
+const aiAnswerCache: AiAnswerCache = {
+  async get(key) {
+    const { data, error } = await supabase
+      .from("ai_answer_cache")
+      .select("value")
+      .eq("key", key)
+      .maybeSingle();
+    if (error) throw error;
+    return data?.value ?? null;
+  },
+  async set(key, value) {
+    const { error } = await supabase.from("ai_answer_cache").upsert({
+      key,
+      value,
+      created_at: new Date().toISOString(),
+    }, { onConflict: "key" });
+    if (error) throw error;
+  },
+};
 const anthropic = new AnthropicClient(
   requiredEnv("ANTHROPIC_API_KEY"),
   Deno.env.get("ANTHROPIC_MODEL") || DEFAULT_ANTHROPIC_MODEL,
+  aiAnswerCache,
 );
 const encryptionKey = requiredEnv("STORE_TOKEN_ENCRYPTION_KEY");
 const runnerSecret = requiredEnv("QA_RUNNER_SECRET");
@@ -158,9 +184,17 @@ Deno.serve(async (request) => {
       ? [await asana.getTask(input.taskGid)]
       : (await asana.listIncompleteTasks(EMIL_ASANA_GID, ASANA_WORKSPACE_GID))
         .filter(isPromoQaTask);
-    await ensureQaTaskWebhooks(tasks, { fullSweep: !input.taskGid }).catch((error) => {
-      console.error("Failed to sync task webhooks:", error);
-    });
+    // Dry runs must not touch Asana, webhooks included.
+    if (!input.dryRun) {
+      await ensureQaTaskWebhooks(tasks, { fullSweep: !input.taskGid }).catch((error) => {
+        console.error("Failed to sync task webhooks:", error);
+      });
+    }
+    if (trigger === "cron") {
+      await housekeeping().catch((error) => {
+        console.error("Housekeeping failed:", error);
+      });
+    }
 
     const results: RunResult[] = [];
     for (const task of tasks) {
@@ -695,11 +729,20 @@ async function replyToIncoming(
     .from("qa_comment_replies")
     .insert({ story_gid: conversation.incoming.gid, task_gid: conversation.incoming.taskGid });
   if (claimError) {
-    if (claimError.code === "23505") return false;
+    // Another run owns this comment and answers it. Report it as handled so
+    // callers don't follow up with a second, formal comment or email.
+    if (claimError.code === "23505") return true;
     console.error("Could not claim the comment before replying:", claimError.message);
   }
 
-  await asana.addQaComment(conversation.incoming.taskGid, recipient, message);
+  try {
+    await asana.addQaComment(conversation.incoming.taskGid, recipient, message);
+  } catch (error) {
+    // Free the comment so a later run can still answer it.
+    await supabase.from("qa_comment_replies").delete()
+      .eq("story_gid", conversation.incoming.gid);
+    throw error;
+  }
   return true;
 }
 
@@ -764,6 +807,24 @@ async function handleMissingEditorUrl(
   }
 
   const designContext = await asana.getPromoDesignContext(context.parent);
+  // Design readiness only decides whether to send a reminder. If none is due
+  // (already sent, no "ready" follow-up since), don't ask Claude again.
+  const reminder = await resolveMissingLinkReminder(context.task.gid, designContext);
+  if (!reminder.shouldSend) {
+    return {
+      ...resultMeta,
+      status: "skipped_not_ready",
+      action: "none",
+      details: {
+        reason: waitingMessage,
+        dueSoon: true,
+        waitingFor: "link",
+        reminderAlreadySent: true,
+        storeResolution,
+      },
+    };
+  }
+
   const designAssessment = await anthropic.assessDesignReadiness({
     qaTaskName: context.task.name,
     qaTaskNotes: stripHtml(context.task.notes ?? context.task.html_notes ?? ""),
@@ -789,7 +850,6 @@ async function handleMissingEditorUrl(
     };
   }
 
-  const reminder = await resolveMissingLinkReminder(context.task.gid, designContext);
   const recipient = getMissingLinkRecipient(
     designContext,
     context.creator,
@@ -1161,22 +1221,47 @@ async function ensureQaTaskWebhooks(
   }
   if (!resourceGids.size && !options.fullSweep) return;
 
-  const { data, error } = await supabase
-    .from("promo_qa_settings")
-    .select("value")
-    .eq("key", TASK_WEBHOOKS_KEY)
-    .maybeSingle();
-  if (error) throw error;
-
-  const stored = (data?.value ?? {}) as {
-    webhooks?: Array<{ gid: string; task_gid: string; active?: boolean }>;
-  };
-  let webhooks = [...(stored.webhooks ?? [])];
-  const known = new Set(webhooks.map((webhook) => webhook.task_gid));
+  type StoredWebhook = { gid: string; task_gid: string; active?: boolean };
+  let webhooks: StoredWebhook[];
   let changed = false;
 
+  if (options.fullSweep) {
+    // Asana is the source of truth: a webhook it deleted or deactivated (after
+    // failed deliveries) must be recreated, not trusted from our stored list.
+    // A full sweep sees every open banner QA task, so anything else is done.
+    webhooks = [];
+    changed = true;
+    for (const webhook of await asana.listTaskWebhooks(ASANA_WORKSPACE_GID, targetUrl)) {
+      if (webhook.active && resourceGids.has(webhook.taskGid)) {
+        webhooks.push({ gid: webhook.gid, task_gid: webhook.taskGid, active: true });
+        continue;
+      }
+      // Finished task, or inactive (deleted here, recreated below if needed).
+      await asana.deleteWebhook(webhook.gid).catch((deleteError) => {
+        if (deleteError instanceof AsanaApiError && deleteError.status === 404) return;
+        console.error(`Task webhook cleanup failed for ${webhook.taskGid}:`, deleteError);
+      });
+    }
+  } else {
+    const { data, error } = await supabase
+      .from("promo_qa_settings")
+      .select("value")
+      .eq("key", TASK_WEBHOOKS_KEY)
+      .maybeSingle();
+    if (error) throw error;
+    webhooks = [
+      ...(((data?.value ?? {}) as { webhooks?: StoredWebhook[] }).webhooks ?? []),
+    ];
+  }
+  const known = new Set(webhooks.map((webhook) => webhook.task_gid));
+
+  let handshakeOpened = false;
   for (const resourceGid of resourceGids) {
     if (known.has(resourceGid)) continue;
+    if (!handshakeOpened) {
+      await openWebhookHandshakeWindow();
+      handshakeOpened = true;
+    }
     try {
       const created = await asana.createResourceWebhook(resourceGid, targetUrl);
       webhooks.push({
@@ -1207,36 +1292,6 @@ async function ensureQaTaskWebhooks(
     }
   }
 
-  // A full sweep sees every open banner QA task, so anything else is done.
-  if (options.fullSweep) {
-    const kept: typeof webhooks = [];
-    for (const webhook of webhooks) {
-      if (resourceGids.has(webhook.task_gid)) {
-        kept.push(webhook);
-        continue;
-      }
-      try {
-        const webhookGid = webhook.gid !== "existing"
-          ? webhook.gid
-          : (await asana.findResourceWebhook(
-            ASANA_WORKSPACE_GID,
-            webhook.task_gid,
-            targetUrl,
-          ))?.gid;
-        if (webhookGid) await asana.deleteWebhook(webhookGid);
-        changed = true;
-      } catch (deleteError) {
-        if (deleteError instanceof AsanaApiError && deleteError.status === 404) {
-          changed = true;
-          continue;
-        }
-        console.error(`Task webhook cleanup failed for ${webhook.task_gid}:`, deleteError);
-        kept.push(webhook);
-      }
-    }
-    webhooks = kept;
-  }
-
   if (!changed) return;
 
   const { error: upsertError } = await supabase.from("promo_qa_settings").upsert({
@@ -1249,6 +1304,49 @@ async function ensureQaTaskWebhooks(
     updated_at: new Date().toISOString(),
   }, { onConflict: "key" });
   if (upsertError) throw upsertError;
+}
+
+/**
+ * asana-webhook only accepts a hook-secret handshake while this window is
+ * open, so nobody else can register a secret and send it signed events.
+ * Asana completes the handshake inside the create-webhook call.
+ */
+async function openWebhookHandshakeWindow(): Promise<void> {
+  const { error } = await supabase.from("promo_qa_settings").upsert({
+    key: "asana_webhook_handshake",
+    value: { open_until: new Date(Date.now() + 5 * 60_000).toISOString() },
+    updated_at: new Date().toISOString(),
+  }, { onConflict: "key" });
+  if (error) throw error;
+}
+
+const RUN_LOG_RETENTION_DAYS = 90;
+
+/** Cron-only cleanup so the log tables and caches don't grow forever. */
+async function housekeeping(): Promise<void> {
+  const daysAgo = (days: number) =>
+    new Date(Date.now() - days * 86_400_000).toISOString();
+  const steps = await Promise.allSettled([
+    // Run items go with their run (on delete cascade).
+    supabase.from("automation_runs").delete()
+      .lt("started_at", daysAgo(RUN_LOG_RETENTION_DAYS)),
+    // A run that never finished (the function hit its time limit).
+    supabase.from("automation_runs").update({
+      status: "error",
+      error_message: "Run never finished (likely hit the function time limit).",
+      completed_at: new Date().toISOString(),
+    }).eq("status", "running").lt("started_at", daysAgo(1 / 24)),
+    supabase.from("ai_answer_cache").delete().lt("created_at", daysAgo(14)),
+    supabase.from("webhook_task_debounce").delete()
+      .like("task_gid", "story:%").lt("last_enqueued_at", daysAgo(7)),
+  ]);
+  for (const step of steps) {
+    if (step.status === "rejected") {
+      console.error("Housekeeping step failed:", step.reason);
+    } else if (step.value.error) {
+      console.error("Housekeeping step failed:", step.value.error.message);
+    }
+  }
 }
 
 function errorMessage(error: unknown): string {

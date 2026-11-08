@@ -5,7 +5,6 @@ import {
   getMissingLinkRecipient,
   isPromoQaTask,
   parseShopifyEditorUrl,
-  promoteSecret,
 } from "../supabase/functions/_shared/asana.ts";
 import {
   applyDeterministicGuards,
@@ -45,6 +44,13 @@ test("Claude requests use Sonnet 5.5 settings and stay valid on rollback", async
   assert.equal(rollback.body.output_config, undefined);
   assert.equal(rollback.body.fallbacks, undefined);
   assert.deepEqual(rollback.headers, {});
+
+  // Dated Claude 4.0 IDs and Claude 3.x take neither effort nor 16k output.
+  for (const model of ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-7-sonnet-latest"]) {
+    assert.equal(buildMessageRequest(model, "sys", {}).body.output_config, undefined, model);
+  }
+  assert.equal(buildMessageRequest("claude-3-7-sonnet-latest", "sys", {}).body.max_tokens, 8192);
+  assert.deepEqual(buildMessageRequest("claude-opus-5-5", "sys", {}).body.output_config, { effort: "low" });
 });
 
 const EMIL = "1206406200377321";
@@ -104,9 +110,54 @@ test("comment html keeps every plain line of a casual reply", () => {
   assert.ok(!html.includes("<br"));
 });
 
-test("promoteSecret moves the match to the front without dropping any", () => {
-  assert.deepEqual(promoteSecret(["a", "b", "c"], 2), ["c", "a", "b"]);
-  assert.deepEqual(promoteSecret(["a", "b"], 0), ["a", "b"]);
+test("failure dedup with no itemised issues compares warnings, never 'nothing'", () => {
+  const noIssues = (warnings) => ({ banners: [], warnings });
+  const posted = formatFailureComment(noIssues(["The Asana specification was ambiguous (60% confidence)."]))
+    .replace(/\n\s*/g, "");
+  assert.equal(
+    failureIssuesCoveredBy(noIssues(["The Asana specification was ambiguous (60% confidence)."]), posted),
+    true,
+  );
+  assert.equal(failureIssuesCoveredBy(noIssues(["Expected 2 banners, found 1."]), posted), false);
+  assert.equal(failureIssuesCoveredBy(noIssues([]), posted), false);
+});
+
+test("missing-link recipient is never Emil, even as the fallback", () => {
+  const recipient = getMissingLinkRecipient(
+    { parentTask: null, subtasks: [], comments: [] },
+    { gid: EMIL, name: "Emil" },
+    EMIL,
+  );
+  assert.equal(recipient, null);
+});
+
+test("Claude answers are cached by input and re-asked when the input changes", async () => {
+  const { AnthropicClient } = await import("../supabase/functions/_shared/ai.ts");
+  const store = new Map();
+  const cache = {
+    get: async (key) => store.get(key) ?? null,
+    set: async (key, value) => void store.set(key, value),
+  };
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({
+      stop_reason: "end_turn",
+      content: [{ type: "text", text: '{"designed":true,"confidence":0.9,"summary":"done","signals":[]}' }],
+    }), { status: 200 });
+  };
+  try {
+    const client = new AnthropicClient("test-key", "claude-sonnet-5-5", cache);
+    const input = { qaTaskName: "Banner Upload QA", qaTaskNotes: "", subtasks: [], comments: [] };
+    await client.assessDesignReadiness(input);
+    await client.assessDesignReadiness({ ...input });
+    assert.equal(calls, 1);
+    await client.assessDesignReadiness({ ...input, comments: [{ text: "design done" }] });
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test("parses Shopify editor target and HTML escaped query", () => {

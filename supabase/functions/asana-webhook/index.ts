@@ -3,10 +3,11 @@ import {
   AsanaClient,
   findMatchingWebhookSecret,
   isPromoQaTask,
-  promoteSecret,
 } from "../_shared/asana.ts";
 import { invokeQaRunner } from "../_shared/runner.ts";
 import type { AsanaWebhookEvent, AsanaWebhookPayload } from "../_shared/types.ts";
+
+declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
 
 const requiredEnv = (name: string): string => {
   const value = Deno.env.get(name);
@@ -34,6 +35,12 @@ Deno.serve(async (request) => {
   const hookSecretHeader = request.headers.get("X-Hook-Secret");
 
   if (hookSecretHeader) {
+    // Only while qa-runner or a setup script is creating a webhook; otherwise
+    // anyone could register a secret and then send us signed events.
+    if (!await isHandshakeWindowOpen()) {
+      console.error("Rejected an unexpected Asana webhook handshake");
+      return new Response("No webhook registration in progress", { status: 403 });
+    }
     await storeWebhookSecret(hookSecretHeader);
     return new Response(null, {
       status: 200,
@@ -49,18 +56,8 @@ Deno.serve(async (request) => {
     }
 
     const signature = request.headers.get("X-Hook-Signature");
-    const matchedIndex = await findMatchingWebhookSecret(
-      secrets,
-      rawBody,
-      signature,
-    );
-    if (matchedIndex < 0) {
+    if (await findMatchingWebhookSecret(secrets, rawBody, signature) < 0) {
       return new Response("Invalid signature", { status: 401 });
-    }
-    if (matchedIndex > 0 && !Deno.env.get("ASANA_WEBHOOK_SECRET")) {
-      await promoteWebhookSecret(secrets[matchedIndex]).catch(
-        (error) => console.error("Failed to reorder webhook secrets:", error),
-      );
     }
 
     if (!await isAutomationEnabled()) {
@@ -73,33 +70,66 @@ Deno.serve(async (request) => {
       return new Response(null, { status: 204 });
     }
 
-    const targets = await resolvePromoQaTargets(events);
-    const invoked: string[] = [];
-    for (const target of targets) {
-      const skipDebounce = Boolean(target.storyGid);
-      if (!skipDebounce && await isDebounced(target.taskGid)) continue;
-      await markDebounced(target.taskGid);
-      await invokeQaRunner({
-        supabaseUrl,
-        runnerSecret,
-        trigger: "webhook",
-        requestedBy: "asana-webhook",
-        taskGid: target.taskGid,
-        storyGid: target.storyGid,
-      });
-      invoked.push(target.taskGid);
-    }
-
-    return Response.json({
-      ok: true,
-      events: events.length,
-      invoked,
-    });
+    // Answer Asana right away: it retries slow deliveries, which used to start
+    // duplicate QA runs. The runs continue in the background.
+    EdgeRuntime.waitUntil(
+      dispatchQaRuns(events).catch((error) =>
+        console.error("Asana webhook dispatch failed:", error)
+      ),
+    );
+    return Response.json({ ok: true, events: events.length });
   } catch (error) {
     console.error("Asana webhook handler failed:", error);
     return new Response(null, { status: 204 });
   }
 });
+
+async function dispatchQaRuns(events: AsanaWebhookEvent[]): Promise<void> {
+  const targets = await resolvePromoQaTargets(events);
+  for (const target of targets) {
+    if (target.storyGid) {
+      // A QA task in a project gets each comment twice: from the project
+      // webhook and from its own task webhook. Run once per comment.
+      if (!await claimStory(target.storyGid, target.taskGid)) continue;
+    } else if (await isDebounced(target.taskGid)) {
+      continue;
+    }
+    await markDebounced(target.taskGid);
+    await invokeQaRunner({
+      supabaseUrl,
+      runnerSecret,
+      trigger: "webhook",
+      requestedBy: "asana-webhook",
+      taskGid: target.taskGid,
+      storyGid: target.storyGid,
+    }).catch((error) =>
+      console.error(`QA run failed for ${target.taskGid}:`, error)
+    );
+  }
+}
+
+async function claimStory(storyGid: string, taskGid: string): Promise<boolean> {
+  const { error } = await supabase.from("webhook_task_debounce").insert({
+    task_gid: `story:${storyGid}:${taskGid}`,
+    last_enqueued_at: new Date().toISOString(),
+  });
+  if (!error) return true;
+  if (error.code === "23505") return false;
+  // Can't tell; better a duplicate run than a missed comment.
+  console.error("Could not claim story:", error.message);
+  return true;
+}
+
+async function isHandshakeWindowOpen(): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("promo_qa_settings")
+    .select("value")
+    .eq("key", "asana_webhook_handshake")
+    .maybeSingle();
+  if (error) throw error;
+  const openUntil = (data?.value as { open_until?: string } | null)?.open_until;
+  return Boolean(openUntil) && new Date(openUntil!).getTime() > Date.now();
+}
 
 async function resolvePromoQaTargets(
   events: AsanaWebhookEvent[],
@@ -107,6 +137,8 @@ async function resolvePromoQaTargets(
   const byTask = new Map<string, string | undefined>();
 
   for (const event of events) {
+    // Some events carry no resource; skip them instead of dropping the batch.
+    if (!event?.resource?.gid) continue;
     const taskGid = await resolveTaskGidFromEvent(event);
     if (!taskGid) continue;
     const storyGid = event.resource.resource_type === "story"
@@ -173,27 +205,10 @@ async function getWebhookSecrets(): Promise<string[]> {
 }
 
 async function storeWebhookSecret(secret: string): Promise<void> {
-  // Newest first: a freshly registered webhook starts sending events right away.
-  await saveWebhookSecrets([...new Set([secret, ...(await getWebhookSecrets())])]);
-}
-
-async function promoteWebhookSecret(secret: string): Promise<void> {
-  // Re-read so a secret stored by a concurrent handshake is never dropped.
-  const fresh = await getWebhookSecrets();
-  const index = fresh.indexOf(secret);
-  if (index <= 0) return;
-  await saveWebhookSecrets(promoteSecret(fresh, index));
-}
-
-async function saveWebhookSecrets(secrets: string[]): Promise<void> {
-  const { error } = await supabase.from("promo_qa_settings").upsert({
-    key: "asana_webhook_secret",
-    value: {
-      secret: secrets[0],
-      secrets,
-    },
-    updated_at: new Date().toISOString(),
-  }, { onConflict: "key" });
+  // One statement in Postgres, so two handshakes at once can't drop a secret.
+  const { error } = await supabase.rpc("add_asana_webhook_secret", {
+    p_secret: secret,
+  });
   if (error) throw error;
 }
 
