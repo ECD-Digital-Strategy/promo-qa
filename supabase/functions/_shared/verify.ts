@@ -125,29 +125,59 @@ export function applyDeterministicGuards(
   };
 }
 
+/**
+ * The comment for a run that did not pass (Emil, 2026-11-24: "this looks like
+ * too much text", and Hugo got the same warnings every run on a banner that
+ * was set up right).
+ *
+ *   - Real problems found: just those, per banner. No warnings under them;
+ *     the problem is what the web person needs, and the warnings buried it.
+ *   - The banner could not be matched in the theme: say so, with at most two
+ *     reasons.
+ *   - Nothing wrong found, only not sure enough to tick the task (an unclear
+ *     task, usually a missing promo link): one short note, posted once.
+ */
+export const UNSURE_MARKER = "can't pass this one automatically";
+export const UNMATCHED_MARKER = "couldn't match the banner";
+
+const isAmbiguityLine = (w: string) => /specification was ambiguous|confidence/i.test(w);
+
 export function formatFailureComment(verdict: QaVerdict): string {
-  const lines = ["Automated promo QA found configuration issues:", ""];
-  for (const banner of verdict.banners) {
-    if (banner.ok) continue;
-    lines.push(`• ${banner.label}`);
-    for (const issue of banner.issues) {
-      lines.push(`  - ${issue}`);
+  const failing = verdict.banners.filter((banner) => !banner.ok && (banner.issues ?? []).length);
+  if (failing.length) {
+    const lines = ["Automated promo QA found configuration issues:", ""];
+    for (const banner of failing) {
+      lines.push(`• ${banner.label}`);
+      for (const issue of banner.issues) lines.push(`  - ${issue}`);
+      lines.push("");
     }
-    lines.push("");
+    return lines.join("\n").trim();
   }
-  for (const warning of verdict.warnings ?? []) {
-    if (!isActionableWarning(warning)) continue;
-    lines.push(`Warning: ${warning}`);
+  const reasons = (verdict.warnings ?? [])
+    .filter(isActionableWarning)
+    .filter((w) => !isAmbiguityLine(w));
+  if (!verdict.passed) {
+    return [
+      `Automated promo QA found configuration issues: I ${UNMATCHED_MARKER} in the theme, so I couldn't check its dates or link.`,
+      ...reasons.slice(0, 2).map((r) => `- ${r}`),
+    ].join("\n").trim();
   }
-  return lines.join("\n").trim();
+  return [
+    `Automated promo QA: the dates and link look right, but I ${UNSURE_MARKER} because the task is unclear.`,
+    ...(reasons.length ? [`- ${reasons[0]}`] : []),
+    "Please give it a quick look and tick this task.",
+  ].join("\n").trim();
 }
 
 /**
- * True when an earlier failure comment already lists every current issue, so
- * posting again would only repeat it. New or changed issues return false.
+ * True when an earlier failure comment already said this, so posting again
+ * would only repeat it. Itemised problems compare one by one, so a new or
+ * changed problem is posted. The other two kinds compare by their marker,
+ * never by the warnings' wording, which the AI phrases differently every run
+ * (that is what reposted on Hugo's WCS task every half hour).
  */
 export function failureIssuesCoveredBy(
-  verdict: Pick<QaVerdict, "banners"> & Partial<Pick<QaVerdict, "warnings">>,
+  verdict: Pick<QaVerdict, "banners"> & Partial<Pick<QaVerdict, "warnings" | "passed">>,
   previousCommentText: string,
 ): boolean {
   const normalize = (value: string) =>
@@ -158,15 +188,8 @@ export function failureIssuesCoveredBy(
     .flatMap((banner) => banner.issues ?? [])
     .map(normalize)
     .filter(Boolean);
-  // No itemised issues (missing banners, low confidence): the comment is just
-  // its warnings, so compare those. With nothing at all to compare, don't
-  // claim the earlier comment already said it.
-  const compared = issues.length ? issues : (verdict.warnings ?? [])
-    .filter(isActionableWarning)
-    .map(normalize)
-    .filter(Boolean);
-  if (!compared.length) return false;
-  return compared.every((item) => previous.includes(item));
+  if (issues.length) return issues.every((item) => previous.includes(item));
+  return previous.includes(verdict.passed ? UNSURE_MARKER : UNMATCHED_MARKER);
 }
 
 function guardBanner(

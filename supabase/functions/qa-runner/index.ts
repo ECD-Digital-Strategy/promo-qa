@@ -48,9 +48,12 @@ const ASANA_WORKSPACE_GID = Deno.env.get("ASANA_WORKSPACE_GID") ??
   "1201007545370748";
 const EMIL_ASANA_GID = Deno.env.get("ASANA_ASSIGNEE_GID") ??
   "1206406200377321";
-const CONFIDENCE_THRESHOLD = Number(
-  Deno.env.get("QA_CONFIDENCE_THRESHOLD") ?? "0.85",
-);
+/**
+ * How sure the block match must be before a passing check may tick the task.
+ * Deliberately low and not read from QA_CONFIDENCE_THRESHOLD (0.85), which
+ * held back banners whose dates and link were right (2026-11-24).
+ */
+const MATCH_FLOOR = 0.5;
 
 const requiredEnv = (name: string): string => {
   const value = Deno.env.get(name);
@@ -396,9 +399,15 @@ async function processTask(
     context.editorTarget.themeId,
     publishedThemeId,
   );
-  const confidentlyPassed = verdict.passed &&
-    verdict.confidence >= CONFIDENCE_THRESHOLD &&
-    spec.confidence >= CONFIDENCE_THRESHOLD;
+  // Passes on the checks themselves (Emil, 2026-11-24: Hugo's WCS banner had
+  // the right dates and link and "should've been a pass already"). The dates
+  // and link are compared in code by applyDeterministicGuards, so when every
+  // banner was found and is ok, that is the answer. The spec's own confidence
+  // no longer gates anything: it dropped whenever the promo link was not on
+  // the calendar yet, even with the banner set up right. The match score only
+  // has to clear MATCH_FLOOR, so a pure guess at which block is the banner
+  // still never ticks a task.
+  const confidentlyPassed = verdict.passed && verdict.confidence >= MATCH_FLOOR;
 
   if (input.dryRun) {
     return {
@@ -438,14 +447,6 @@ async function processTask(
     };
   }
 
-  if (spec.confidence < CONFIDENCE_THRESHOLD) {
-    verdict.warnings.push(
-      `The Asana specification was ambiguous (${
-        Math.round(spec.confidence * 100)
-      }% confidence).`,
-      ...spec.ambiguities,
-    );
-  }
 
   const repliedToHuman = conversation?.intent.replyNeeded
     ? await replyToIncoming(context, conversation, {

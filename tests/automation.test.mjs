@@ -110,16 +110,37 @@ test("comment html keeps every plain line of a casual reply", () => {
   assert.ok(!html.includes("<br"));
 });
 
-test("failure dedup with no itemised issues compares warnings, never 'nothing'", () => {
-  const noIssues = (warnings) => ({ banners: [], warnings });
-  const posted = formatFailureComment(noIssues(["The Asana specification was ambiguous (60% confidence)."]))
-    .replace(/\n\s*/g, "");
-  assert.equal(
-    failureIssuesCoveredBy(noIssues(["The Asana specification was ambiguous (60% confidence)."]), posted),
-    true,
-  );
-  assert.equal(failureIssuesCoveredBy(noIssues(["Expected 2 banners, found 1."]), posted), false);
-  assert.equal(failureIssuesCoveredBy(noIssues([]), posted), false);
+test("a banner with a real problem: the problem only, no warnings under it", () => {
+  const posted = formatFailureComment({
+    passed: false,
+    banners: [{ label: "BFCM 2026 Promo Banner", ok: false, issues: ["End date mismatch: expected 2026-11-30, found 2026-11-26."] }],
+    warnings: ["Spec confidence is 0.75; the copy contains a placeholder 'UP TO XX% OFF'.", "The Asana specification was ambiguous (75% confidence)."],
+  });
+  assert.ok(posted.includes("End date mismatch"));
+  assert.ok(!/warning|placeholder|ambiguous/i.test(posted));
+});
+
+test("nothing wrong, only unsure: one short note, never repeated whatever the wording", () => {
+  const unsure = (warnings) => ({ passed: true, banners: [{ label: "WCS - Promo Banner", ok: true, issues: [] }], warnings });
+  const first = formatFailureComment(unsure([
+    "The Asana specification was ambiguous (70% confidence).",
+    "The PROMO LINK field says it has not been added to the calendar yet.",
+    "No timezone specified.",
+  ]));
+  assert.ok(first.includes("look right"));
+  assert.ok(first.split("\n").length <= 3, "short");
+  assert.ok(!/ambiguous/i.test(first));
+  // The next run words its warnings differently: still covered, so not reposted.
+  assert.equal(failureIssuesCoveredBy(unsure(["Spec promo_link is null.", "Timezone unknown."]), first.replace(/\n\s*/g, "")), true);
+});
+
+test("banner not found: says so with at most two reasons, and is not repeated", () => {
+  const missing = (warnings) => ({ passed: false, banners: [], warnings });
+  const posted = formatFailureComment(missing(["No matching banner block was found by promo link.", "Promo link is not provided.", "Timezone inferred.", "Fourth."]));
+  assert.ok(posted.includes("couldn't match the banner"));
+  assert.equal(posted.split("\n").length, 3);
+  assert.equal(failureIssuesCoveredBy(missing(["Different words this time."]), posted), true);
+  assert.equal(failureIssuesCoveredBy(missing([]), "an unrelated comment"), false);
 });
 
 test("missing-link recipient is never Emil, even as the fallback", () => {
