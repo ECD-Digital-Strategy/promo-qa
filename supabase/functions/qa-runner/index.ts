@@ -367,10 +367,12 @@ async function processTask(
     });
   }
 
-  const [template, publishedThemeId] = await Promise.all([
-    getIndexJson(store, context.editorTarget.themeId),
-    getPublishedThemeId(store),
-  ]);
+  // Always the live theme (Emil, 2026-11-27): CC's Banner Upload QA failed
+  // twice on an old theme from the editor link in the task (disabled there)
+  // while both banners were on, dated and linked right in the live one.
+  // The editor link still gives the section and block to look for.
+  const publishedThemeId = await getPublishedThemeId(store);
+  const template = await getIndexJson(store, publishedThemeId);
   const spec = await anthropic.parsePromoSpec({
     taskName: context.task.name,
     taskNotes: context.task.notes ?? context.task.html_notes ?? "",
@@ -378,10 +380,12 @@ async function processTask(
     parentNotes: context.parent?.notes ?? context.parent?.html_notes,
     currentDate: new Date().toISOString().slice(0, 10),
   });
-  const blocks = collectBannerBlocks(
+  // A section id from another theme may not exist in the live one.
+  const hinted = collectBannerBlocks(
     template,
     context.editorTarget.sectionHint,
   );
+  const blocks = hinted.length ? hinted : collectBannerBlocks(template);
   const matches = matchExpectedBanners(
     spec.banners,
     blocks,
@@ -390,13 +394,13 @@ async function processTask(
   const aiVerdict = await anthropic.verifyCandidates({
     spec,
     candidates: matches,
-    configuredThemeId: context.editorTarget.themeId,
+    configuredThemeId: publishedThemeId,
     publishedThemeId,
   });
   const verdict = applyDeterministicGuards(
     aiVerdict,
     matches,
-    context.editorTarget.themeId,
+    publishedThemeId,
     publishedThemeId,
   );
   // Passes on the checks themselves (Emil, 2026-11-24: Hugo's WCS banner had
